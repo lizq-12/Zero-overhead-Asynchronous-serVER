@@ -11,12 +11,20 @@
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
+/* All timeouts use milliseconds and CLOCK_MONOTONIC internally. */
+#define ZV_DEFAULT_KEEP_ALIVE_TIMEOUT_MS 5000
+#define ZV_DEFAULT_REQUEST_TIMEOUT_MS    5000
+
 struct zv_conf_s {
     void *root;
     int port;
     int thread_num;
     int workers;
     int cpu_affinity;
+
+    /* timeouts (ms) */
+    int keep_alive_timeout_ms; /* idle connection timeout */
+    int request_timeout_ms;    /* in-flight request/response timeout */
 };
 
 typedef struct zv_conf_s zv_conf_t;

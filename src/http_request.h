@@ -71,6 +71,10 @@ typedef struct zv_http_request_s {
 
     void *timer;
 
+    /* timeouts (ms) copied from config at init */
+    size_t keep_alive_timeout_ms;
+    size_t request_timeout_ms;
+
     /* output state for non-blocking write continuation */
     int keep_alive;                 /* for current response */
     int writing;                    /* 1 when waiting EPOLLOUT to continue */
