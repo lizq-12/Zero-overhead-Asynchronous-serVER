@@ -1,10 +1,21 @@
 *.swp
-*.log
-*.o
-build/
 *_test
 tags
-html/big_64m.bin
+# 忽略 CMake 构建目录
 build/
+build_cache/
+build_nocache/
+cmake-build-debug/
+# 忽略 IDE 配置文件 (VSCode, JetBrains 等)
+.vscode/
+.vscode-ctags
 .idea/
+# 忽略 编译产生的二进制文件
+*.o
+*.a
+*.so
+bin/
+# 忽略 日志文件
 *.log
+# 忽略 临时测试大文件 (之前提过的)
+html/big_64m.bin
