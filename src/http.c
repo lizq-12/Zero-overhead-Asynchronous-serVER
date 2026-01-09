@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <sys/uio.h>
@@ -175,12 +177,137 @@ static void rearm_event(zv_http_request_t *r, uint32_t events) {
     event.events = events | EPOLLET | EPOLLONESHOT;
     zv_epoll_mod(r->epfd, r->fd, &event);
 }
+// 计算 keep-alive 超时时间（秒）（向上取整）
+static int keep_alive_timeout_sec(const zv_http_request_t *r) {
+    if (!r) return 0;
+    size_t ms = r->keep_alive_timeout_ms;
+    if (ms == 0) return 0;
+    /* HTTP Keep-Alive header uses seconds; round up and clamp to >=1. */
+    int sec = (int)((ms + 999) / 1000);
+    if (sec < 1) sec = 1;
+    return sec;
+}
 
 static const char* get_file_type(const char *type);
-static void parse_uri(char *uri, int length, char *filename, char *querystring);
+static int parse_uri(const char *uri, int length, char *filename, size_t filename_cap, char *querystring);
 static int prepare_error(zv_http_request_t *r, char *cause, char *errnum, char *shortmsg, char *longmsg, int keep_alive);
 static int prepare_static(zv_http_request_t *r, char *filename, size_t filesize, zv_http_out_t *out);
 static char *ROOT = NULL;
+// 将十六进制字符转换为对应的整数值
+static int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+// 对百分号编码的字符串进行解码
+static int percent_decode(const char *in, size_t in_len, char *out, size_t out_cap, size_t *out_len) {
+    if (!in || !out || out_cap == 0) return -1;
+    size_t j = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch == '%') {
+            // 需要两个字符来表示一个十六进制数
+            if (i + 2 >= in_len) return -1;
+            int hi = hex_val(in[i + 1]);// 高四位
+            int lo = hex_val(in[i + 2]);// 低四位
+            if (hi < 0 || lo < 0) return -1;// 非法的十六进制字符
+            ch = (unsigned char)((hi << 4) | lo);// 合并为一个字节
+            i += 2;
+        }
+
+        /* Basic hardening: reject NUL/backslash and control chars. */
+        // 拒绝NUL（\0\）、反斜杠（\）、回车（\r）和换行（\n）
+        if (ch == 0 || ch == '\\' || ch == '\r' || ch == '\n') return -1;
+        // 检查输出缓冲区是否有足够空间
+        if (j + 1 >= out_cap) return -1;
+        out[j++] = (char)ch;
+    }
+    out[j] = '\0';
+    if (out_len) *out_len = j;
+    return 0;
+}
+// 规范化绝对路径，处理 . 和 .. 段 合并多余斜杠
+// 返回值: 0表示成功，-1表示失败
+static int normalize_abs_path(const char *path, size_t path_len, char *out, size_t out_cap, int *ends_with_slash) {
+    if (!path || !out || out_cap < 2) return -1;
+    if (path_len == 0 || path[0] != '/') return -1;
+    // 记录路径是否以斜杠结尾
+    int trailing_slash = (path_len > 0 && path[path_len - 1] == '/');
+
+    size_t stack[256];
+    size_t sp = 0;
+
+    size_t out_len = 1;
+    out[0] = '/';
+    out[1] = '\0';
+
+    size_t i = 1;
+    while (i < path_len) {
+        //跳过多余的斜杠
+        while (i < path_len && path[i] == '/') i++;
+        if (i >= path_len) break;
+
+        size_t seg_start = i;
+        //找到下一个斜杠或者路径结尾
+        while (i < path_len && path[i] != '/') i++;
+        size_t seg_len = i - seg_start;//这段路径段长度
+        if (seg_len == 0) continue;
+        // 处理路径段 忽略 . 段
+        if (seg_len == 1 && path[seg_start] == '.') {
+            continue;
+        }
+        // 处理 .. 段
+        if (seg_len == 2 && path[seg_start] == '.' && path[seg_start + 1] == '.') {
+            if (sp == 0) return -1;//如果当前已经在根（sp==0）
+            sp--;
+            out_len = (sp == 0) ? 1 : stack[sp - 1];// 回退到上一个路径段的末尾
+            out[out_len] = '\0';// 截断路径字符串
+            continue;
+        }
+        // 普通路径段  需要添加斜杠分隔符
+        if (out_len > 1) {
+            if (out_len + 1 >= out_cap) return -1;
+            out[out_len++] = '/';
+        }
+        // 复制路径段
+        if (out_len + seg_len >= out_cap) return -1;
+        memcpy(out + out_len, path + seg_start, seg_len);
+        out_len += seg_len;
+        out[out_len] = '\0';
+        // 将当前路径段的长度压入栈
+        if (sp >= (sizeof(stack) / sizeof(stack[0]))) return -1;
+        stack[sp++] = out_len;
+    }
+    // 如果路径应以斜杠结尾但当前没有，则添加斜杠
+    if (trailing_slash && out_len > 1 && out[out_len - 1] != '/') {
+        if (out_len + 1 >= out_cap) return -1;
+        out[out_len++] = '/';
+        out[out_len] = '\0';
+    }
+    // 设置输出参数是否以斜杠结尾
+    if (ends_with_slash) *ends_with_slash = trailing_slash;
+    return 0;
+}
+// 检查路径 path 是否在根目录 root 下（防止目录遍历攻击）
+static int is_path_under_root_real(const char *root, const char *path) {
+    char root_real[PATH_MAX];
+    char path_real[PATH_MAX];
+
+    if (!root || !path) return 0;
+    //realpath它把混乱的、带欺骗性的路径，转换成唯一的、绝对的物理路径。
+    //如果 path 是 /var/www/html/../../etc/passwd，realpath 会把它变成 /etc/passwd。
+    //如果 path 是 /var/www/html/link_to_secret（一个指向外部的软链接），realpath 会直接解析出它指向的真实地址。
+    if (!realpath(root, root_real)) return 0;
+    if (!realpath(path, path_real)) return 0;
+
+    size_t rlen = strlen(root_real);
+    //拿到两个真实路径后，检查 path_real 是否以 root_real 开头。
+    if (strncmp(path_real, root_real, rlen) != 0) return 0;
+    //边界检查（防止“前缀伪造”攻击）防止strncmp 会比较前 9 个字符（/data/web），发现两者完全一样！于是函数可能错误地返回 1。
+    if (path_real[rlen] == '\0' || path_real[rlen] == '/') return 1;
+    return 0;
+}
 
 mime_type_t zaver_mime[] = 
 {
@@ -277,7 +404,25 @@ void do_request(void *ptr) {
         }
         //至此已经完整解析了一个 HTTP 请求
         //读取 URI 并转换成文件路径
-        parse_uri(r->uri_start, r->uri_end - r->uri_start, filename, NULL);
+        if (parse_uri(r->uri_start, (int)(r->uri_end - r->uri_start), filename, sizeof(filename), NULL) < 0) {
+            rc = prepare_error(r, "invalid uri", "400", "Bad Request", "invalid uri", 0);
+            if (rc < 0) {
+                goto err;
+            }
+            rc = try_send(r);
+            if (rc < 0) {
+                log_send_failed("try_send 400", fd);
+                goto err;
+            }
+            if (rc == 1) {
+                r->writing = 1;
+                rearm_event(r, EPOLLOUT);
+                zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
+                return;
+            }
+            reset_output(r);
+            goto close;
+        }
         //为响应分配并初始化输出结构体
         zv_http_out_t *out = (zv_http_out_t *)malloc(sizeof(zv_http_out_t));
         if (out == NULL) {
@@ -299,6 +444,26 @@ void do_request(void *ptr) {
             rc = try_send(r);
             if (rc < 0) {
                 log_send_failed("try_send 404", fd);
+                free(out);
+                goto err;
+            }
+            if (rc == 1) {
+                r->writing = 1;
+            } else {
+                reset_output(r);
+            }
+            goto request_done;
+        }
+        //检查文件路径是否在根目录下
+        if (!is_path_under_root_real(ROOT, filename)) {
+            rc = prepare_error(r, filename, "403", "Forbidden", "path is outside docroot", out->keep_alive);
+            if (rc < 0) {
+                free(out);
+                goto err;
+            }
+            rc = try_send(r);
+            if (rc < 0) {
+                log_send_failed("try_send 403(root)", fd);
                 free(out);
                 goto err;
             }
@@ -387,7 +552,7 @@ request_done:
         if (r->writing) {
             free(out);
             rearm_event(r, EPOLLOUT);
-            zv_add_timer(r, TIMEOUT_DEFAULT, zv_http_close_conn);
+            zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
             return;
         }
 
@@ -400,7 +565,9 @@ request_done:
     }
     
     rearm_event(r, EPOLLIN);
-    zv_add_timer(r, TIMEOUT_DEFAULT, zv_http_close_conn);
+    /* If we already buffered some request data (or are mid-parse), treat it as in-flight. */
+    size_t tmo = (r->last > 0 || r->parse_phase != 0) ? r->request_timeout_ms : r->keep_alive_timeout_ms;
+    zv_add_timer(r, tmo, zv_http_close_conn);
     return;
 
 err:
@@ -420,7 +587,7 @@ void do_write(void *ptr) {
     if (rc == 1) {
         r->writing = 1;
         rearm_event(r, EPOLLOUT);
-        zv_add_timer(r, TIMEOUT_DEFAULT, zv_http_close_conn);
+        zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
         return;
     }
 
@@ -445,55 +612,98 @@ void do_write(void *ptr) {
     }
 
     rearm_event(r, EPOLLIN);
-    zv_add_timer(r, TIMEOUT_DEFAULT, zv_http_close_conn);
+    zv_add_timer(r, r->keep_alive_timeout_ms, zv_http_close_conn);
 }
 //uri="/" → filename=ROOT + "/" → 末尾是 / → 最终 ROOT/index.html
 //uri="/50x.html" → 末尾段有 . → 最终 ROOT/50x.html
 //uri="/docs" → 末尾段没 . → 补 / → 补 index.html → ROOT/docs/index.html
 //uri="/img.png?x=1" → file_length 只取到 ? 前 → 最终 ROOT/img.png
-static void parse_uri(char *uri, int uri_length, char *filename, char *querystring) {
-    check(uri != NULL, "parse_uri: uri is NULL");
-    uri[uri_length] = '\0';
-    //在 URI 中查找是否有 ? 返回指向它的指针
-    char *question_mark = strchr(uri, '?');
-    int file_length;
-    if (question_mark) {
-        file_length = (int)(question_mark - uri);
-        debug("file_length = (question_mark - uri) = %d", file_length);
-    } else {
-        file_length = uri_length;
-        debug("file_length = uri_length = %d", file_length);
-    }
-    //预留：如果你未来想把 ? 后面的 query 保存到 querystring，在这里实现。
-    if (querystring) {
-        //TODO
-    }
-    //先把站点根目录拷到 filename，比如 ROOT="/home/.../html"
-    strcpy(filename, ROOT);
-
-    // uri_length can not be too long
-    // 它检查的是 uri_length，而真正用于拼接的其实是 file_length；而且 filename 里还要先放 ROOT，所以严格来说这不是完全充分的安全检查，但作者的意图是“别让 URI 太长”。
-    if (uri_length > (SHORTLINE >> 1)) {
-        log_err("uri too long: %.*s", uri_length, uri);
-        return;
+static int parse_uri(const char *uri, int uri_length, char *filename, size_t filename_cap, char *querystring) {
+    (void)querystring;
+    if (!uri || !filename || filename_cap == 0 || !ROOT) {
+        return -1;
     }
 
-    debug("before strncat, filename = %s, uri = %.*s, file_len = %d", filename, file_length, uri, file_length);
-    //把 URI 的路径部分拼到 ROOT 后面，得到初步文件路径。file_length表示在 URI 中不包含 ? 的路径部分的长度
-    strncat(filename, uri, file_length);
-
-    char *last_comp = strrchr(filename, '/');
-    char *last_dot = strrchr(last_comp, '.');
-    if (last_dot == NULL && filename[strlen(filename)-1] != '/') {
-        strcat(filename, "/");
+    if (uri_length <= 0) {
+        return -1;
     }
-    //如果路径以 / 结尾，说明是目录，补上默认首页文件名
-    if(filename[strlen(filename)-1] == '/') {
-        strcat(filename, "index.html");
+
+    if ((size_t)uri_length > (SHORTLINE >> 1)) {
+        log_err("uri too long");
+        return -1;
+    }
+
+    int path_len = uri_length;
+    // 它先扫描 ?，只取 ? 前面的部分当 path
+    for (int i = 0; i < uri_length; i++) {
+        if (uri[i] == '?') {
+            path_len = i;
+            break;
+        }
+    }
+    if (path_len <= 0) {
+        return -1;
+    }
+
+    char decoded[SHORTLINE];
+    size_t decoded_len = 0;
+    // 先对 path 部分进行百分号解码同时检查合法性
+    if (percent_decode(uri, (size_t)path_len, decoded, sizeof(decoded), &decoded_len) < 0) {
+        return -1;
+    }
+    if (decoded_len == 0 || decoded[0] != '/') {// 必须是绝对路径
+        return -1;
+    }
+    // 规范化绝对路径，处理 . 和 .. 段 合并多余斜杠
+    char norm[SHORTLINE];
+    if (normalize_abs_path(decoded, decoded_len, norm, sizeof(norm), NULL) < 0) {
+        return -1;
+    }
+
+    char path_final[SHORTLINE];
+    size_t path_final_len = 0;
+    path_final[0] = '\0';
+
+    size_t norm_len = strlen(norm);
+    if (norm_len == 0) {
+        return -1;
+    }
+    // 
+    int is_dir = (norm_len > 0 && norm[norm_len - 1] == '/');
+    if (!is_dir) {// 不是目录 则检查最后一个路径段是否有扩展名
+        const char *last_slash = strrchr(norm, '/');
+        const char *last_comp = last_slash ? (last_slash + 1) : norm;
+        if (last_comp && strchr(last_comp, '.') == NULL) {// 没有扩展名 则补上斜杠
+            if (snprintf(path_final, sizeof(path_final), "%s/", norm) < 0) return -1;
+        } else {// 有扩展名 直接复制
+            if (snprintf(path_final, sizeof(path_final), "%s", norm) < 0) return -1;
+        }
+    } else {// 是目录 直接复制
+        if (snprintf(path_final, sizeof(path_final), "%s", norm) < 0) return -1;
+    }
+    // 如果 path_final 以斜杠结尾 则补上 index.html
+    path_final_len = strlen(path_final);
+    if (path_final_len == 0) return -1;
+    if (path_final[path_final_len - 1] == '/') {
+        if (path_final_len + strlen("index.html") + 1 >= sizeof(path_final)) return -1;
+        strcat(path_final, "index.html");
+    }
+    // 拼接 ROOT 和 path_final 得到最终的文件路径
+    const char *root = ROOT;
+    size_t root_len = strlen(root);
+    const char *path_part = path_final;
+    // 避免出现双斜杠
+    if (root_len > 0 && root[root_len - 1] == '/' && path_part[0] == '/') {
+        path_part = path_part + 1;
+    }
+    // 拼接得到最终文件路径
+    int n = snprintf(filename, filename_cap, "%s%s", root, path_part);
+    if (n < 0 || (size_t)n >= filename_cap) {
+        return -1;
     }
 
     log_info("filename = %s", filename);
-    return;
+    return 0;
 }
 // 准备错误响应（由 try_send/do_write 负责真正发送）
 static int prepare_error(zv_http_request_t *r, char *cause, char *errnum, char *shortmsg, char *longmsg, int keep_alive)
@@ -527,7 +737,7 @@ static int prepare_error(zv_http_request_t *r, char *cause, char *errnum, char *
 
     if (keep_alive) {
         (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Connection: keep-alive\r\n");
-        (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Keep-Alive: timeout=%d\r\n", TIMEOUT_DEFAULT);
+        (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Keep-Alive: timeout=%d\r\n", keep_alive_timeout_sec(r));
     } else {
         (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Connection: close\r\n");
     }
@@ -557,7 +767,7 @@ static int prepare_static(zv_http_request_t *r, char *filename, size_t filesize,
    
     if (out->keep_alive) {
         (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Connection: keep-alive\r\n");
-        (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Keep-Alive: timeout=%d\r\n", TIMEOUT_DEFAULT);
+        (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Keep-Alive: timeout=%d\r\n", keep_alive_timeout_sec(r));
     } else {
         (void)appendf(r->out_header, sizeof(r->out_header), &header_len, "Connection: close\r\n");
     }

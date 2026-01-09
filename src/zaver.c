@@ -71,7 +71,12 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    log_status("zaver started. port=%d workers=%d cpu_affinity=%d", cf.port, cf.workers,cf.cpu_affinity);
+    log_status("zaver started. port=%d workers=%d cpu_affinity=%d keep_alive_timeout_ms=%d request_timeout_ms=%d",
+               cf.port,
+               cf.workers,
+               cf.cpu_affinity,
+               cf.keep_alive_timeout_ms,
+               cf.request_timeout_ms);
     //运行服务器
     return zv_run_server(&cf);
 }

@@ -91,4 +91,46 @@ else
     tail -n 200 "$LOG_FILE" || true
 fi
 
+# 4.3 安全回归：路径穿越应被拒绝（400/403），不能读到仓库文件
+echo "Request: http://127.0.0.1:3000/../CMakeLists.txt (expect 400/403)"
+HTTP_CODE=$(curl --max-time 3 -o /dev/null -s -w "%{http_code}" http://127.0.0.1:3000/../CMakeLists.txt || true)
+if [[ "$HTTP_CODE" != "400" && "$HTTP_CODE" != "403" ]]; then
+    echo -e "${RED}FAILED: traversal should be blocked, got $HTTP_CODE${NC}"
+    RESULT=1
+fi
+
+echo "Request: http://127.0.0.1:3000/%2e%2e/CMakeLists.txt (expect 400/403)"
+HTTP_CODE=$(curl --max-time 3 -o /dev/null -s -w "%{http_code}" http://127.0.0.1:3000/%2e%2e/CMakeLists.txt || true)
+if [[ "$HTTP_CODE" != "400" && "$HTTP_CODE" != "403" ]]; then
+    echo -e "${RED}FAILED: encoded traversal should be blocked, got $HTTP_CODE${NC}"
+    RESULT=1
+fi
+
+# 4.4 安全回归：软链接逃逸应被拒绝（403）
+DOCROOT="$ROOT_DIR/html"
+OUTSIDE_DIR="$ROOT_DIR/tests/_tmp_outside"
+LINK_NAME="$DOCROOT/__ci_symlink_escape__"
+
+mkdir -p "$OUTSIDE_DIR"
+echo "ci" >"$OUTSIDE_DIR/outside.txt"
+
+rm -f "$LINK_NAME"
+ln -s "$OUTSIDE_DIR/outside.txt" "$LINK_NAME"
+
+echo "Request: http://127.0.0.1:3000/__ci_symlink_escape__ (expect 403)"
+HTTP_CODE=$(curl --max-time 3 -o /dev/null -s -w "%{http_code}" http://127.0.0.1:3000/__ci_symlink_escape__ || true)
+rm -f "$LINK_NAME"
+
+if [[ "$HTTP_CODE" != "403" ]]; then
+    echo -e "${RED}FAILED: symlink escape should be blocked, got $HTTP_CODE${NC}"
+    RESULT=1
+fi
+
+if [[ "$RESULT" -eq 0 ]]; then
+    echo -e "${GREEN}All functional + security tests passed.${NC}"
+else
+    echo "--- server log (tail) ---"
+    tail -n 200 "$LOG_FILE" || true
+fi
+
 exit $RESULT

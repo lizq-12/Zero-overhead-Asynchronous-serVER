@@ -62,12 +62,12 @@ int zv_run_server(zv_conf_t *cf) {
             int rc = zv_worker_run(cf, i);
             _exit(rc);//子进程运行结束后退出 (这个退出不会刷新缓冲区 虽然在这里没什么影响)
         }
-        pids[i] = pid;
+        pids[i] = pid;//保存子进程PID
     }
     // master进程等待子进程退出
     while (!zv_stop) {
         int status = 0;
-        pid_t pid = waitpid(-1, &status, 0);//阻塞等待任一子进程退出
+        pid_t pid = waitpid(-1, &status, 0);//阻塞等待任一子进程退出 所以master进程不会占用过多CPU
         if (pid < 0) {
             if (errno == EINTR) continue;//被信号中断则继续等待
             log_err("waitpid failed");

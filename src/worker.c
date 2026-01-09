@@ -198,7 +198,7 @@ int zv_worker_run(zv_conf_t *cf, int worker_id) {
                     event.data.ptr = (void *)req;
                     event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
                     zv_epoll_add(epfd, infd, &event);
-                    zv_add_timer(req, TIMEOUT_DEFAULT, zv_http_close_conn);// 添加定时器
+                    zv_add_timer(req, req->keep_alive_timeout_ms, zv_http_close_conn);// idle timeout
                 }
             } 
             else // 处理已连接套接字的事件

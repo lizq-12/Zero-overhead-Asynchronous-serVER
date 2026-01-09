@@ -59,6 +59,15 @@ int zv_init_request_t(zv_http_request_t *r, int fd, int epfd, zv_conf_t *cf) {
     r->cur_header_value_start = NULL;
     r->cur_header_value_end = NULL;
 
+    /* timeouts (ms) */
+    if (cf) {
+        r->keep_alive_timeout_ms = (cf->keep_alive_timeout_ms > 0) ? (size_t)cf->keep_alive_timeout_ms : (size_t)ZV_DEFAULT_KEEP_ALIVE_TIMEOUT_MS;
+        r->request_timeout_ms = (cf->request_timeout_ms > 0) ? (size_t)cf->request_timeout_ms : (size_t)ZV_DEFAULT_REQUEST_TIMEOUT_MS;
+    } else {
+        r->keep_alive_timeout_ms = (size_t)ZV_DEFAULT_KEEP_ALIVE_TIMEOUT_MS;
+        r->request_timeout_ms = (size_t)ZV_DEFAULT_REQUEST_TIMEOUT_MS;
+    }
+
     r->timer = NULL;//初始化 timer 为 NULL
     INIT_LIST_HEAD(&(r->freelist));//初始化 freelist 链表头
 
@@ -88,7 +97,7 @@ int zv_free_request_t(zv_http_request_t *r) {
         zv_http_header_free(hd);
     }
     INIT_LIST_HEAD(&(r->list));
-    
+
     if (r->out_body) {
         free(r->out_body);
         r->out_body = NULL;
@@ -102,7 +111,7 @@ int zv_free_request_t(zv_http_request_t *r) {
 
     return ZV_OK;
 }
-
+// 初始化 HTTP 输出结构体
 int zv_init_out_t(zv_http_out_t *o, int fd) {
     o->fd = fd;
     o->keep_alive = 0;

@@ -21,10 +21,10 @@
 // 注意：SO_REUSEPORT必须在bind()之前设置。
 int open_listenfd_reuseport(int port)
 {
+    // 默认端口3000
     if (port <= 0) {
         port = 3000;
     }
-
     int listenfd, optval = 1;
     struct sockaddr_in serveraddr;
 
@@ -91,6 +91,8 @@ int read_conf(char *filename, zv_conf_t *cf, char *buf, int len) {
     cf->thread_num = 4;
     cf->workers = 1;
     cf->cpu_affinity = 0;
+    cf->keep_alive_timeout_ms = ZV_DEFAULT_KEEP_ALIVE_TIMEOUT_MS;
+    cf->request_timeout_ms = ZV_DEFAULT_REQUEST_TIMEOUT_MS;
 
     int pos = 0;
     char *delim_pos;
@@ -126,6 +128,21 @@ int read_conf(char *filename, zv_conf_t *cf, char *buf, int len) {
 
         if (strncmp("cpu_affinity", cur_pos, 12) == 0) {
             cf->cpu_affinity = atoi(delim_pos + 1);
+        }
+
+        if (strncmp("keep_alive_timeout_ms", cur_pos, 20) == 0) {
+            cf->keep_alive_timeout_ms = atoi(delim_pos + 1);
+        }
+
+        if (strncmp("request_timeout_ms", cur_pos, 18) == 0) {
+            cf->request_timeout_ms = atoi(delim_pos + 1);
+        }
+
+        /* alias: set both timeouts */
+        if (strncmp("timeout_ms", cur_pos, 10) == 0) {
+            int t = atoi(delim_pos + 1);
+            cf->keep_alive_timeout_ms = t;
+            cf->request_timeout_ms = t;
         }
 
         cur_pos += line_len;
