@@ -123,6 +123,12 @@ int zv_init_request_t(zv_http_request_t *r, int fd, int epfd, zv_conf_t *cf) {
     r->cgi_hdr_len = 0;
     r->cgi_http_header_len = 0;
     r->cgi_http_header_sent = 0;
+
+    r->cgi_chunk_prefix_len = 0;
+    r->cgi_chunk_prefix_sent = 0;
+    r->cgi_chunk_suffix_sent = 0;
+    r->cgi_final_chunk_len = 0;
+    r->cgi_final_chunk_sent = 0;
     r->cgi_body_len = 0;
     r->cgi_body_sent = 0;
 
@@ -132,7 +138,7 @@ int zv_init_request_t(zv_http_request_t *r, int fd, int epfd, zv_conf_t *cf) {
 int zv_free_request_t(zv_http_request_t *r) {
     list_head *pos, *next;
     zv_http_header_t *hd;
-    
+    // 释放请求头链表
     for (pos = r->list.next; pos != &(r->list); pos = next) {
         next = pos->next;
         hd = list_entry(pos, zv_http_header_t, list);
@@ -140,7 +146,7 @@ int zv_free_request_t(zv_http_request_t *r) {
         zv_http_header_free(hd);
     }
     INIT_LIST_HEAD(&(r->list));
-
+    // 释放输出相关资源
     if (r->out_body) {
         free(r->out_body);
         r->out_body = NULL;
@@ -149,7 +155,7 @@ int zv_free_request_t(zv_http_request_t *r) {
         close(r->out_file_fd);
         r->out_file_fd = -1;
     }
-
+    
     /* CGI cleanup (best-effort) */
     if (r->cgi_active) {
         if (r->cgi_pid > 0) {

@@ -5,3 +5,12 @@
 
 printf "Content-Type: text/plain\r\n\r\n"
 printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"
+printf "hello cgi\n"

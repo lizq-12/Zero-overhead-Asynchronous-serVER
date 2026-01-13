@@ -64,12 +64,15 @@ static int parse_content_type(const char *line, char *out, size_t out_cap) {
     out[n] = '\0';
     return 1;
 }
-// 构建 CGI 响应的 HTTP 头
-/*"HTTP/1.1 %d %s\r\n"
+// 构建 CGI 响应的 HTTP 头（chunked）
+/*
+"HTTP/1.1 %d %s\r\n"
 "Server: Zaver\r\n"
 "Connection: close\r\n"
 "Content-Type: %s\r\n"
-"\r\n"*/
+"Transfer-Encoding: chunked\r\n"
+"\r\n"
+*/
 static int build_http_header(zv_http_request_t *r, int status, const char *content_type) {
     if (!r) return -1;
     // 获取状态码对应的短语
@@ -89,12 +92,44 @@ static int build_http_header(zv_http_request_t *r, int status, const char *conte
                      "Server: Zaver\r\n"
                      "Connection: close\r\n"
                      "Content-Type: %s\r\n"
+                     "Transfer-Encoding: chunked\r\n"
                      "\r\n",
                      status, reason, content_type);
     if (n < 0 || (size_t)n >= sizeof(r->cgi_http_header)) return -1;
     r->cgi_http_header_len = (size_t)n;
     r->cgi_http_header_sent = 0;
+
+    r->cgi_chunk_prefix_len = 0;
+    r->cgi_chunk_prefix_sent = 0;
+    r->cgi_chunk_suffix_sent = 0;
+    r->cgi_final_chunk_len = 0;
+    r->cgi_final_chunk_sent = 0;
     return 0;
+}
+
+static int prepare_chunk_prefix(zv_http_request_t *r, size_t chunk_len) {
+    if (!r) return -1;
+    if (chunk_len == 0) {
+        r->cgi_chunk_prefix_len = 0;
+        r->cgi_chunk_prefix_sent = 0;
+        r->cgi_chunk_suffix_sent = 0;
+        return 0;
+    }
+    int n = snprintf(r->cgi_chunk_prefix, sizeof(r->cgi_chunk_prefix), "%zx\r\n", chunk_len);
+    if (n < 0 || (size_t)n >= sizeof(r->cgi_chunk_prefix)) return -1;
+    r->cgi_chunk_prefix_len = (size_t)n;
+    r->cgi_chunk_prefix_sent = 0;
+    r->cgi_chunk_suffix_sent = 0;
+    return 0;
+}
+
+static void ensure_final_chunk(zv_http_request_t *r) {
+    if (!r) return;
+    if (r->cgi_final_chunk_len == 0) {
+        memcpy(r->cgi_final_chunk, "0\r\n\r\n", 5);
+        r->cgi_final_chunk_len = 5;
+        r->cgi_final_chunk_sent = 0;
+    }
 }
 // 确保 CGI 输出事件的 epoll item 已分配并正确初始化
 static void ensure_cgi_items(zv_http_request_t *r) {
@@ -215,19 +250,20 @@ int zv_cgi_start(zv_http_request_t *r, const char *script_filename, const char *
     r->cgi_hdr_len = 0;
     r->cgi_http_header_len = 0;
     r->cgi_http_header_sent = 0;
+
     r->cgi_body_len = 0;
     r->cgi_body_sent = 0;
     //准备 epoll data.ptr 的 “item” 结构
     ensure_cgi_items(r);
-    //把 CGI stdout fd 加入 epoll 监听读事件
+    //把 CGI stdout fd 加入 epoll 监听读事件（pipe 用 LT + ONESHOT，配合“读一块就回写”的反压模型）
     struct epoll_event ev;
     ev.data.ptr = (void *)r->cgi_out_item;
-    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    ev.events = EPOLLIN | EPOLLONESHOT;
     zv_epoll_add(r->epfd, r->cgi_out_fd, &ev);
 
-    /* CGI responses are streamed without Content-Length; force close. */
-    //CGI 输出通常不带 Content-Length（你现在也是“流式转发”），要 keep-alive 就得实现 chunked 或缓冲完整长度再发；
-    //MVP 先用“发完就关连接”简化状态机，减少 bug 面。
+    /* CGI responses are streamed using chunked transfer encoding; still force close for MVP. */
+    //CGI 输出是流式转发：现在用 Transfer-Encoding: chunked 明确响应边界；
+    //MVP 仍然用“发完就关连接”简化状态机，减少 bug 面。
     r->keep_alive = 0;
 
     /* CGI shares request timeout for MVP */
@@ -242,7 +278,10 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
 
     for (;;) {
         //反压：如果我们还有未发送的正文数据，则停止读取。
-        if (r->cgi_body_sent < r->cgi_body_len) {
+        if (r->cgi_body_len > 0 &&
+            (r->cgi_chunk_prefix_sent < r->cgi_chunk_prefix_len ||
+             r->cgi_body_sent < r->cgi_body_len ||
+             r->cgi_chunk_suffix_sent < 2)) {
             break;
         }
         // 读取 CGI 输出 读到的数据放在 r->cgi_body_buf 里
@@ -332,9 +371,14 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
                         memmove(r->cgi_body_buf, hdr + body_off, remain);
                         r->cgi_body_len = remain;
                         r->cgi_body_sent = 0;
+                        if (prepare_chunk_prefix(r, r->cgi_body_len) != 0) {
+                            zv_http_close_conn(r);
+                            return;
+                        }
                     } else {
                         r->cgi_body_len = 0;
                         r->cgi_body_sent = 0;
+                        (void)prepare_chunk_prefix(r, 0);
                     }
                     // 重置 header buffer 长度
                     r->cgi_hdr_len = 0;
@@ -350,6 +394,10 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
             } else {
                 r->cgi_body_len = (size_t)n;
                 r->cgi_body_sent = 0;
+                if (prepare_chunk_prefix(r, r->cgi_body_len) != 0) {
+                    zv_http_close_conn(r);
+                    return;
+                }
             }
             // 数据准备好了 要求写信给客户
             struct epoll_event e;
@@ -361,17 +409,85 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
             return;
         }
         // EOF 表示 CGI 子进程已经关闭 stdout（通常也意味着进程快退出了）
+        /* EOF */
         if (n == 0) {
             r->cgi_eof = 1;//告诉写回侧“不会再有更多 body”
             close(r->cgi_out_fd);//关闭 pipe fd
             r->cgi_out_fd = -1;
-            break;
+            /*
+            * If the CGI process exits without producing a valid CGI header terminator,
+            * the client would otherwise hang until request timeout. Be lenient:
+            * - If there is buffered output, treat it as body with a default 200 header.
+            * - If there is no output at all, return 500.
+            */
+            if (!r->cgi_headers_done) {
+                if (r->cgi_hdr_len > 0) {
+                    if (build_http_header(r, 200, "text/plain") != 0) {
+                        zv_http_close_conn(r);
+                        return;
+                    }
+                    size_t remain = r->cgi_hdr_len;
+                    if (remain > sizeof(r->cgi_body_buf)) {
+                        if (build_http_header(r, 500, "text/plain") != 0) {
+                            zv_http_close_conn(r);
+                            return;
+                        }
+                        const char *msg = "cgi output too large\n";
+                        size_t msg_len = strlen(msg);
+                        if (msg_len > sizeof(r->cgi_body_buf)) msg_len = sizeof(r->cgi_body_buf);
+                        memcpy(r->cgi_body_buf, msg, msg_len);
+                        r->cgi_body_len = msg_len;
+                    } else {
+                        memcpy(r->cgi_body_buf, r->cgi_hdr_buf, remain);
+                        r->cgi_body_len = remain;
+                    }
+                    r->cgi_body_sent = 0;
+                    if (prepare_chunk_prefix(r, r->cgi_body_len) != 0) {
+                        zv_http_close_conn(r);
+                        return;
+                    }
+                    r->cgi_headers_done = 1;
+                    r->cgi_hdr_len = 0;
+                } else {
+                    if (build_http_header(r, 500, "text/plain") != 0) {
+                        zv_http_close_conn(r);
+                        return;
+                    }
+                    const char *msg = "cgi produced no output\n";
+                    size_t msg_len = strlen(msg);
+                    if (msg_len > sizeof(r->cgi_body_buf)) msg_len = sizeof(r->cgi_body_buf);
+                    memcpy(r->cgi_body_buf, msg, msg_len);
+                    r->cgi_body_len = msg_len;
+                    r->cgi_body_sent = 0;
+                    if (prepare_chunk_prefix(r, r->cgi_body_len) != 0) {
+                        zv_http_close_conn(r);
+                        return;
+                    }
+                    r->cgi_headers_done = 1;
+                }
+
+                struct epoll_event e;
+                e.data.ptr = (void *)r->conn_item;
+                e.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+                zv_epoll_mod(r->epfd, r->fd, &e);
+                zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
+                return;
+            }
+
+            /* Normal case: headers already parsed. EOF => send final chunk to terminate body. */
+            ensure_final_chunk(r);
+            struct epoll_event e;
+            e.data.ptr = (void *)r->conn_item;
+            e.events = EPOLLOUT | EPOLLET | EPOLLONESHOT;
+            zv_epoll_mod(r->epfd, r->fd, &e);
+            zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
+            return;
         }
         // 信号打断，重试 read。
         if (errno == EINTR) {
             continue;
         }
-        // 非阻塞下“暂时没数据”，说明已经读干净了（ET 里这是正确退出点），break 出循环。
+        // 非阻塞下“暂时没数据”，break 出循环。
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         }
@@ -380,13 +496,11 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
         return;
     }
     //如果 CGI 标准输出仍然处于活动状态且不是 EOF，则重新启用 CGI 标准输出事件。
-    //这次把能读的都读完了，内核缓冲区空了
-    //不是“数据不够/空了”，而是“反压：有数据我也先不读”
     /* Re-arm CGI stdout if still active and not EOF. */
     if (r->cgi_active && r->cgi_out_fd >= 0) {
         struct epoll_event ev;
         ev.data.ptr = (void *)r->cgi_out_item;
-        ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        ev.events = EPOLLIN | EPOLLONESHOT;
         zv_epoll_mod(r->epfd, r->cgi_out_fd, &ev);
     }
 
@@ -396,37 +510,100 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
 int zv_cgi_on_client_writable(zv_http_request_t *r) {
     if (!r || !r->cgi_active) return -1;
 
-    /* Send HTTP header (once) + body buffer. */
-    //用 writev() 一次性尽量写 “header + body”
-    while (r->cgi_http_header_sent < r->cgi_http_header_len || r->cgi_body_sent < r->cgi_body_len) {
-        struct iovec iov[2];
+    /* Send HTTP header once, then stream body using chunked transfer encoding. */
+    for (;;) {
+        struct iovec iov[4];
         int iovcnt = 0;
+
         if (r->cgi_http_header_sent < r->cgi_http_header_len) {
             iov[iovcnt].iov_base = r->cgi_http_header + r->cgi_http_header_sent;
             iov[iovcnt].iov_len = r->cgi_http_header_len - r->cgi_http_header_sent;
             iovcnt++;
         }
-        if (r->cgi_body_sent < r->cgi_body_len) {
-            iov[iovcnt].iov_base = r->cgi_body_buf + r->cgi_body_sent;
-            iov[iovcnt].iov_len = r->cgi_body_len - r->cgi_body_sent;
-            iovcnt++;
+
+        if (r->cgi_body_len > 0) {
+            if (r->cgi_chunk_prefix_sent < r->cgi_chunk_prefix_len) {
+                iov[iovcnt].iov_base = r->cgi_chunk_prefix + r->cgi_chunk_prefix_sent;
+                iov[iovcnt].iov_len = r->cgi_chunk_prefix_len - r->cgi_chunk_prefix_sent;
+                iovcnt++;
+            }
+            if (r->cgi_body_sent < r->cgi_body_len) {
+                iov[iovcnt].iov_base = r->cgi_body_buf + r->cgi_body_sent;
+                iov[iovcnt].iov_len = r->cgi_body_len - r->cgi_body_sent;
+                iovcnt++;
+            }
+            if (r->cgi_chunk_suffix_sent < 2) {
+                static const char crlf[] = "\r\n";
+                iov[iovcnt].iov_base = (void *)(crlf + r->cgi_chunk_suffix_sent);
+                iov[iovcnt].iov_len = 2 - r->cgi_chunk_suffix_sent;
+                iovcnt++;
+            }
+        } else if (r->cgi_eof) {
+            ensure_final_chunk(r);
+            if (r->cgi_final_chunk_sent < r->cgi_final_chunk_len) {
+                iov[iovcnt].iov_base = r->cgi_final_chunk + r->cgi_final_chunk_sent;
+                iov[iovcnt].iov_len = r->cgi_final_chunk_len - r->cgi_final_chunk_sent;
+                iovcnt++;
+            }
+        } else {
+            /* nothing to send right now */
+            break;
         }
-        // 循环保证写完
+
+        if (iovcnt == 0) {
+            break;
+        }
+
         ssize_t n = writev(r->fd, iov, iovcnt);
         if (n > 0) {
             ssize_t left = n;
+
             if (r->cgi_http_header_sent < r->cgi_http_header_len) {
-                size_t hrem = r->cgi_http_header_len - r->cgi_http_header_sent;
-                size_t hcons = (left >= (ssize_t)hrem) ? hrem : (size_t)left;
-                r->cgi_http_header_sent += hcons;
-                left -= (ssize_t)hcons;
+                size_t rem = r->cgi_http_header_len - r->cgi_http_header_sent;
+                size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
+                r->cgi_http_header_sent += cons;
+                left -= (ssize_t)cons;
             }
-            if (left > 0 && r->cgi_body_sent < r->cgi_body_len) {
-                size_t brem = r->cgi_body_len - r->cgi_body_sent;
-                size_t bcons = (left >= (ssize_t)brem) ? brem : (size_t)left;
-                r->cgi_body_sent += bcons;
-                left -= (ssize_t)bcons;
+
+            if (left > 0 && r->cgi_body_len > 0) {
+                if (r->cgi_chunk_prefix_sent < r->cgi_chunk_prefix_len) {
+                    size_t rem = r->cgi_chunk_prefix_len - r->cgi_chunk_prefix_sent;
+                    size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
+                    r->cgi_chunk_prefix_sent += cons;
+                    left -= (ssize_t)cons;
+                }
+                if (left > 0 && r->cgi_body_sent < r->cgi_body_len) {
+                    size_t rem = r->cgi_body_len - r->cgi_body_sent;
+                    size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
+                    r->cgi_body_sent += cons;
+                    left -= (ssize_t)cons;
+                }
+                if (left > 0 && r->cgi_chunk_suffix_sent < 2) {
+                    size_t rem = 2 - r->cgi_chunk_suffix_sent;
+                    size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
+                    r->cgi_chunk_suffix_sent += cons;
+                    left -= (ssize_t)cons;
+                }
+
+                if (r->cgi_chunk_prefix_sent == r->cgi_chunk_prefix_len &&
+                    r->cgi_body_sent == r->cgi_body_len &&
+                    r->cgi_chunk_suffix_sent == 2) {
+                    r->cgi_body_len = 0;
+                    r->cgi_body_sent = 0;
+                    r->cgi_chunk_prefix_len = 0;
+                    r->cgi_chunk_prefix_sent = 0;
+                    r->cgi_chunk_suffix_sent = 0;
+                }
             }
+
+            if (left > 0 && r->cgi_eof && r->cgi_body_len == 0 && r->cgi_final_chunk_len > 0 &&
+                r->cgi_final_chunk_sent < r->cgi_final_chunk_len) {
+                size_t rem = r->cgi_final_chunk_len - r->cgi_final_chunk_sent;
+                size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
+                r->cgi_final_chunk_sent += cons;
+                left -= (ssize_t)cons;
+            }
+
             continue;
         }
 
@@ -439,24 +616,22 @@ int zv_cgi_on_client_writable(zv_http_request_t *r) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
-    //当前准备好的 header+body chunk 都写完了
-    /* Sent current buffered body chunk. Reset body buffer. */
-    //释放反压  从而 允许继续读取 CGI stdout。
-    r->cgi_body_len = 0;
-    r->cgi_body_sent = 0;
-    //如果 CGI 已经 EOF：可以结束 CGI 生命周期 
+
     if (r->cgi_eof) {
-        /* Reap child (best-effort) and close. */
-        if (r->cgi_pid > 0) {
-            (void)waitpid(r->cgi_pid, NULL, WNOHANG);
+        ensure_final_chunk(r);
+        if (r->cgi_final_chunk_sent >= r->cgi_final_chunk_len) {
+            if (r->cgi_pid > 0) {
+                (void)waitpid(r->cgi_pid, NULL, WNOHANG);
+            }
+            return 0;
         }
-        return 0;
+        return 1;
     }
-    //如果没 EOF：继续等待更多 CGI 输出
+
     if (r->cgi_out_fd >= 0) {
         struct epoll_event ev;
         ev.data.ptr = (void *)r->cgi_out_item;
-        ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+        ev.events = EPOLLIN | EPOLLONESHOT;
         zv_epoll_mod(r->epfd, r->cgi_out_fd, &ev);
     }
 

@@ -113,6 +113,15 @@ typedef struct zv_http_request_s {
     size_t cgi_http_header_len;
     size_t cgi_http_header_sent;
 
+    /* chunked transfer encoding state for CGI streaming */
+    char cgi_chunk_prefix[32];
+    size_t cgi_chunk_prefix_len;
+    size_t cgi_chunk_prefix_sent;
+    size_t cgi_chunk_suffix_sent; /* "\r\n" after each chunk */
+    char cgi_final_chunk[8];      /* "0\r\n\r\n" */
+    size_t cgi_final_chunk_len;
+    size_t cgi_final_chunk_sent;
+
     char cgi_body_buf[8192];
     size_t cgi_body_len;
     size_t cgi_body_sent;

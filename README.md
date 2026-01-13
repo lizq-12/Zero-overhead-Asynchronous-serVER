@@ -61,6 +61,8 @@ chmod +x tests/perf/bench.sh
 BUILD_DIR=build THREADS=4 CONNS=500 DURATION=30s ./tests/perf/bench.sh
 ```
 
+The benchmark supports multiple modes (default `MODE=full`) and reports both average and max latency from `wrk`.
+
 ## support
 
 * HTTP/1.1 Persistent Connections (Keep-Alive)
