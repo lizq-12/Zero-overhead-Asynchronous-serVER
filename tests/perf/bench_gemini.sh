@@ -126,13 +126,19 @@ echo "Date: $(date)" >> "$OUT_MD"
 echo "| Scenario | QPS | Throughput | Latency (Avg) | P99 | CPU% | Mem |" >> "$OUT_MD"
 echo "|---|---|---|---|---|---|---|" >> "$OUT_MD"
 
-# 开始测试
-run_test "Baseline (Small)" "$URL_SMALL" 4 500 20s
-run_test "Throughput (Big)" "$URL_BIG" 4 100 20s
-run_test "C10K Scalability" "$URL_SMALL" 4 5000 20s
-run_test "Short Connection" "$URL_SMALL" 4 500 20s "-H Connection:close"
-run_test "CGI Dynamic" "$URL_CGI" 4 50 20s
+# 开始测试 (注意：这里每一行后面都加了 >> "$OUT_MD")
+
+run_test "Baseline (Small)" "$URL_SMALL" 4 500 20s >> "$OUT_MD"
+
+run_test "Throughput (Big)" "$URL_BIG" 4 100 20s >> "$OUT_MD"
+
+run_test "C10K Scalability" "$URL_SMALL" 4 5000 20s >> "$OUT_MD"
+
+run_test "Short Connection" "$URL_SMALL" 4 500 20s "-H Connection:close" >> "$OUT_MD"
+
+run_test "CGI Dynamic" "$URL_CGI" 4 50 20s >> "$OUT_MD"
 
 echo "" >> "$OUT_MD"
 echo "Done! Report: $OUT_MD"
+# 把生成的内容打印出来给用户看
 cat "$OUT_MD"
