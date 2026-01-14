@@ -97,7 +97,7 @@ void zv_http_request_put(zv_http_request_t *r) {
     g_put_calls++;//DBUG 统计释放调用次数
     put_internal(r);//放入缓存空闲链表
 }
-// 延迟释放 zv_http_request_t 结构体到缓存空闲链表
+// 释放 zv_http_request_t 结构体延迟释放链表
 void zv_http_request_put_deferred(zv_http_request_t *r) {
     if (!r) return;
     init_once();

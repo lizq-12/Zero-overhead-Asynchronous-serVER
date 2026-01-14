@@ -105,26 +105,26 @@ typedef struct zv_http_request_s {
     size_t cgi_out_total;
     size_t cgi_out_limit;
 
-    int cgi_headers_done; //用于把 CGI 输出的头（比如 Content-Type:）解析出来，再生成真正的 HTTP 响应头给 client。
-    char cgi_hdr_buf[4096];
-    size_t cgi_hdr_len;
+    int cgi_headers_done; //标志 CGI 响应头是否已经完整读完。
+    char cgi_hdr_buf[4096];// CGI 响应头缓冲区
+    size_t cgi_hdr_len;// 已读到缓冲区的字节数
 
-    char cgi_http_header[4096];
-    size_t cgi_http_header_len;
-    size_t cgi_http_header_sent;
+    char cgi_http_header[4096];// CGI 生成的 HTTP 响应头发送缓冲区
+    size_t cgi_http_header_len;// CGI 生成的 HTTP 响应头长度
+    size_t cgi_http_header_sent;// CGI 生成的 HTTP 响应头已发送字节数
 
     /* chunked transfer encoding state for CGI streaming */
-    char cgi_chunk_prefix[32];
-    size_t cgi_chunk_prefix_len;
-    size_t cgi_chunk_prefix_sent;
-    size_t cgi_chunk_suffix_sent; /* "\r\n" after each chunk */
+    char cgi_chunk_prefix[32]; // 每个 chunk 前缀缓冲区（格式：<chunk-size>\r\n）
+    size_t cgi_chunk_prefix_len;// 前缀长度
+    size_t cgi_chunk_prefix_sent;// 已发送前缀字节数
+    size_t cgi_chunk_suffix_sent; //后缀\r\n已发送字节数
     char cgi_final_chunk[8];      /* "0\r\n\r\n" */
     size_t cgi_final_chunk_len;
     size_t cgi_final_chunk_sent;
 
-    char cgi_body_buf[8192];
-    size_t cgi_body_len;
-    size_t cgi_body_sent;
+    char cgi_body_buf[8192];    // CGI 输出正文缓冲区
+    size_t cgi_body_len;        // 正文字节数
+    size_t cgi_body_sent;       // 已发送正文字节数
 } zv_http_request_t;
 
 typedef struct {

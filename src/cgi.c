@@ -107,6 +107,14 @@ static int build_http_header(zv_http_request_t *r, int status, const char *conte
     return 0;
 }
 
+//Content-Length（内存开销大，延迟高），要么就没发 Content-Length 导致客户端报错。
+//chunked 编码允许你告诉客户端：“我不知道总共有多长，但我会一截一截地发给你，每一截有多长我会告诉你。”
+/*Chunk（数据块）:
+当前块的数据长度（16进制字符串）。\r\n (CRLF)。
+实际数据。\r\n (CRLF)。
+End Chunk（结束块）:
+必须发送一个长度为 0 的块来表示传输结束。
+格式：0\r\n\r\n。*/
 static int prepare_chunk_prefix(zv_http_request_t *r, size_t chunk_len) {
     if (!r) return -1;
     if (chunk_len == 0) {
@@ -115,6 +123,7 @@ static int prepare_chunk_prefix(zv_http_request_t *r, size_t chunk_len) {
         r->cgi_chunk_suffix_sent = 0;
         return 0;
     }
+    // 构建块前缀（长度行）
     int n = snprintf(r->cgi_chunk_prefix, sizeof(r->cgi_chunk_prefix), "%zx\r\n", chunk_len);
     if (n < 0 || (size_t)n >= sizeof(r->cgi_chunk_prefix)) return -1;
     r->cgi_chunk_prefix_len = (size_t)n;
@@ -122,7 +131,7 @@ static int prepare_chunk_prefix(zv_http_request_t *r, size_t chunk_len) {
     r->cgi_chunk_suffix_sent = 0;
     return 0;
 }
-
+// 准备结束块数据
 static void ensure_final_chunk(zv_http_request_t *r) {
     if (!r) return;
     if (r->cgi_final_chunk_len == 0) {
@@ -277,11 +286,12 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
     zv_del_timer(r);
 
     for (;;) {
-        //反压：如果我们还有未发送的正文数据，则停止读取。
+        //反压：如果我们还有未发送的数据，则停止读取。
         if (r->cgi_body_len > 0 &&
             (r->cgi_chunk_prefix_sent < r->cgi_chunk_prefix_len ||
              r->cgi_body_sent < r->cgi_body_len ||
-             r->cgi_chunk_suffix_sent < 2)) {
+             r->cgi_chunk_suffix_sent < 2)) 
+        {
             break;
         }
         // 读取 CGI 输出 读到的数据放在 r->cgi_body_buf 里
@@ -411,17 +421,14 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
         // EOF 表示 CGI 子进程已经关闭 stdout（通常也意味着进程快退出了）
         /* EOF */
         if (n == 0) {
-            r->cgi_eof = 1;//告诉写回侧“不会再有更多 body”
+            r->cgi_eof = 1;//给“写回客户端”的那侧 (zv_cgi_on_client_writable) 一个信号：后面不会再有新的 body 数据块了，应该在合适的时候发送 final chunk（0\r\n\r\n）。
             close(r->cgi_out_fd);//关闭 pipe fd
             r->cgi_out_fd = -1;
-            /*
-            * If the CGI process exits without producing a valid CGI header terminator,
-            * the client would otherwise hang until request timeout. Be lenient:
-            * - If there is buffered output, treat it as body with a default 200 header.
-            * - If there is no output at all, return 500.
-            */
+            //有的 CGI 脚本可能 没按 CGI 规范输出头部结束符（也就是没输出 \r\n\r\n 或 \n\n），导致你一直处于“还在等 CGI headers 完整”的状态。
+            //EOF 时还没解析出 CGI 头
             if (!r->cgi_headers_done) {
                 if (r->cgi_hdr_len > 0) {
+                    // 有部分输出，把它当 body 发出去
                     if (build_http_header(r, 200, "text/plain") != 0) {
                         zv_http_close_conn(r);
                         return;
@@ -473,7 +480,7 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
                 zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
                 return;
             }
-
+            //正常 EOF 路径（已经解析过 CGI headers）应该发送 final chunk 来终止 chunked body。
             /* Normal case: headers already parsed. EOF => send final chunk to terminate body. */
             ensure_final_chunk(r);
             struct epoll_event e;
@@ -503,35 +510,38 @@ void zv_cgi_on_stdout_ready(zv_http_request_t *r) {
         ev.events = EPOLLIN | EPOLLONESHOT;
         zv_epoll_mod(r->epfd, r->cgi_out_fd, &ev);
     }
-
     zv_add_timer(r, r->request_timeout_ms, zv_http_close_conn);
 }
-// 处理 CGI 响应可写事件 -1: error  0: finished  1: would block  2: need more reading
+
+// 处理 CGI 响应可写事件 
+//-1: error  0: finished  1: would block  2: need more reading
 int zv_cgi_on_client_writable(zv_http_request_t *r) {
     if (!r || !r->cgi_active) return -1;
-
     /* Send HTTP header once, then stream body using chunked transfer encoding. */
     for (;;) {
         struct iovec iov[4];
         int iovcnt = 0;
-
+        // 先发送 HTTP 头
         if (r->cgi_http_header_sent < r->cgi_http_header_len) {
             iov[iovcnt].iov_base = r->cgi_http_header + r->cgi_http_header_sent;
             iov[iovcnt].iov_len = r->cgi_http_header_len - r->cgi_http_header_sent;
             iovcnt++;
         }
-
+        // 然后发送 body chunks
         if (r->cgi_body_len > 0) {
+            //块前缀
             if (r->cgi_chunk_prefix_sent < r->cgi_chunk_prefix_len) {
                 iov[iovcnt].iov_base = r->cgi_chunk_prefix + r->cgi_chunk_prefix_sent;
                 iov[iovcnt].iov_len = r->cgi_chunk_prefix_len - r->cgi_chunk_prefix_sent;
                 iovcnt++;
             }
+            //块数据
             if (r->cgi_body_sent < r->cgi_body_len) {
                 iov[iovcnt].iov_base = r->cgi_body_buf + r->cgi_body_sent;
                 iov[iovcnt].iov_len = r->cgi_body_len - r->cgi_body_sent;
                 iovcnt++;
             }
+            //块后缀 \r\n
             if (r->cgi_chunk_suffix_sent < 2) {
                 static const char crlf[] = "\r\n";
                 iov[iovcnt].iov_base = (void *)(crlf + r->cgi_chunk_suffix_sent);
@@ -553,11 +563,10 @@ int zv_cgi_on_client_writable(zv_http_request_t *r) {
         if (iovcnt == 0) {
             break;
         }
-
+        // 发送数据
         ssize_t n = writev(r->fd, iov, iovcnt);
         if (n > 0) {
             ssize_t left = n;
-
             if (r->cgi_http_header_sent < r->cgi_http_header_len) {
                 size_t rem = r->cgi_http_header_len - r->cgi_http_header_sent;
                 size_t cons = (left >= (ssize_t)rem) ? rem : (size_t)left;
@@ -616,7 +625,7 @@ int zv_cgi_on_client_writable(zv_http_request_t *r) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
         return -1;
     }
-
+    //全部数据都发送完了 回收子进程
     if (r->cgi_eof) {
         ensure_final_chunk(r);
         if (r->cgi_final_chunk_sent >= r->cgi_final_chunk_len) {
@@ -627,11 +636,11 @@ int zv_cgi_on_client_writable(zv_http_request_t *r) {
         }
         return 1;
     }
-
+    //还有更多数据要读 回调 zv_cgi_on_stdout_ready 继续读
     if (r->cgi_out_fd >= 0) {
         struct epoll_event ev;
         ev.data.ptr = (void *)r->cgi_out_item;
-        ev.events = EPOLLIN | EPOLLONESHOT;
+          ev.events = EPOLLIN | EPOLLONESHOT;
         zv_epoll_mod(r->epfd, r->cgi_out_fd, &ev);
     }
 

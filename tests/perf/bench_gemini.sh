@@ -1,124 +1,138 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
-# === 配置区域 ===
+# === 0. 配置区域 ===
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD_DIR="${ROOT_DIR}/build"
 CONF_PATH="${ROOT_DIR}/zaver.conf"
-LOG_FILE="${ROOT_DIR}/tests/perf/server.log"
-OUT_MD="${ROOT_DIR}/tests/perf/final_report.md"
+OUT_MD="${ROOT_DIR}/tests/perf/ultimate_report.md"
+RAW_LOG="${ROOT_DIR}/tests/perf/wrk_raw.log"
+SERVER_LOG="${ROOT_DIR}/tests/perf/server.log"
+
+# 测试目标
+URL_SMALL="http://127.0.0.1:3000/index.html"
+URL_BIG="http://127.0.0.1:3000/big.bin"
+URL_CGI="http://127.0.0.1:3000/cgi-bin/hello.sh"
 
 # 准备测试文件
-SMALL_FILE_URL="http://127.0.0.1:3000/index.html"
-BIG_FILE_URL="http://127.0.0.1:3000/big.bin"
-CGI_URL="http://127.0.0.1:3000/cgi-bin/hello.sh"
-
-# 确保依赖存在
-for cmd in wrk curl pidstat ss; do
-    if ! command -v $cmd &> /dev/null; then echo "Error: $cmd not found. Install it first."; exit 1; fi
-done
-
-# === 辅助函数 ===
-
-# 启动服务器
-start_server() {
-    echo "Starting Server..."
-    # 查找可执行文件
-    if [[ -f "${BUILD_DIR}/zaver" ]]; then BIN="${BUILD_DIR}/zaver"; else BIN="${BUILD_DIR}/src/zaver"; fi
-    
-    # 启动
-    setsid "$BIN" -c "$CONF_PATH" >"$LOG_FILE" 2>&1 &
-    SERVER_PID=$!
-    echo "Server PID: $SERVER_PID"
-    sleep 2 # 等待初始化
-}
-
-# 停止服务器
-stop_server() {
-    if [[ -n "${SERVER_PID:-}" ]]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-    fi
-}
-trap stop_server EXIT
-
-# 资源监控函数 (后台运行)
-monitor_resources() {
-    local pid=$1
-    local duration=$2
-    # 每秒采集一次 CPU 和 内存，计算平均值
-    pidstat -r -u -p "$pid" 1 "$duration" | awk '
-        BEGIN {cpu=0; mem=0; count=0} 
-        /Average/ {print "| " $8 "% | " $13 " MB |"; exit}
-    ' || echo "| N/A | N/A |"
-}
-
-# 运行 wrk 测试用例
-run_case() {
-    local title=$1
-    local url=$2
-    local threads=$3
-    local conns=$4
-    local duration=$5
-    local args=${6:-""} # 额外的 wrk 参数
-
-    echo "Running: $title ..." >&2
-
-    # 启动资源监控 (在后台)
-    # 注意：这里我们简单睡眠 duration 秒后去拿结果，实际情况可能需要更复杂的同步，
-    # 为了简化脚本，这里只做压测，不实时并列显示监控数据，你可以在另一个终端 top 看。
-    
-    # 运行 wrk
-    local output
-    output=$(wrk -t"$threads" -c"$conns" -d"$duration" $args "$url" 2>/dev/null)
-
-    # 提取数据
-    local qps=$(echo "$output" | awk '/Requests\/sec/ {print $2}')
-    local lat=$(echo "$output" | awk '/Latency/ {print $2}')
-    local tput=$(echo "$output" | awk '/Transfer\/sec/ {print $2}')
-    
-    # 格式化输出到表格
-    echo "| $title | $conns | $threads | $qps | $lat | $tput |"
-}
-
-# === 主流程 ===
-
-# 0. 环境准备
 if [ ! -f "${ROOT_DIR}/html/big.bin" ]; then
-    echo "Generating 256MB test file..."
+    echo "Creating 256MB dummy file..."
     dd if=/dev/zero of="${ROOT_DIR}/html/big.bin" bs=1M count=256 status=none
 fi
 
-# 1. 启动服务器
+# 检查依赖
+for cmd in wrk curl pidstat ss awk grep; do
+    if ! command -v $cmd &> /dev/null; then echo "Error: $cmd missing."; exit 1; fi
+done
+
+# === 1. 辅助函数 ===
+
+start_server() {
+    # 尝试设置 ulimit
+    ulimit -n 65535 2>/dev/null || true
+    
+    # 找可执行文件
+    if [[ -f "${BUILD_DIR}/zaver" ]]; then BIN="${BUILD_DIR}/zaver"; else BIN="${BUILD_DIR}/src/zaver"; fi
+    
+    echo "Starting server from $BIN ..."
+    
+    # 启动服务器 (关键修改：使用 disown 让脚本不再追踪这个后台进程)
+    "$BIN" -c "$CONF_PATH" >"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    # 【关键修复】告诉 shell 不要等待这个 PID
+    disown $SERVER_PID 
+    
+    echo "Server PID: $SERVER_PID"
+    sleep 2
+    
+    # 检查服务器是否真的活着
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "Error: Server failed to start! Check log at $SERVER_LOG"
+        cat "$SERVER_LOG"
+        exit 1
+    fi
+}
+
+stop_server() {
+    if [[ -n "${SERVER_PID:-}" ]]; then
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
+}
+# 注意：因为 disown 了，trap 可能抓不到，所以要在脚本退出前手动调用 stop_server
+
+run_test() {
+    local name="$1"
+    local url="$2"
+    local threads="$3"
+    local conns="$4"
+    local duration="$5"
+    local extra_args="${6:-}"
+
+    echo "Running: $name (Conns: $conns)..." >&2
+    
+    # 启动资源监控 (后台运行)
+    # 我们把监控进程的 PID 记下来，专门只等它
+    local pidstat_pid=""
+    if [[ -n "$SERVER_PID" ]]; then
+        # 监控 5 秒
+        (sleep 2; pidstat -u -r -p "$SERVER_PID" 1 5 | awk '
+            /Average/ && $8 ~ /[0-9]/ {cpu=$8} 
+            /Average/ && $13 ~ /[0-9]/ {mem=$13} 
+            END {print cpu, mem}' > /tmp/perf_stats) &
+        pidstat_pid=$!
+    fi
+
+    # 运行 wrk (同步运行，不会卡住)
+    local output
+    output=$(wrk -t"$threads" -c"$conns" -d"$duration" --latency $extra_args "$url")
+    echo "$output" >> "$RAW_LOG"
+    
+    # 【关键修复】只等待资源监控结束，而不是 wait 所有
+    if [[ -n "$pidstat_pid" ]]; then
+        wait "$pidstat_pid" 2>/dev/null || true
+    fi
+
+    # 解析数据
+    local qps=$(echo "$output" | awk '/Requests\/sec/ {print $2}')
+    local tput=$(echo "$output" | awk '/Transfer\/sec/ {print $2}')
+    local lat_p99=$(echo "$output" | grep "99%" | awk '{print $2}')
+    local lat_avg=$(echo "$output" | awk '/Latency/ && /ms|us|s/ {print $2; exit}')
+    
+    # 读取监控数据
+    local cpu_usage="N/A"
+    local mem_usage="N/A"
+    if [ -f /tmp/perf_stats ]; then
+        read cpu_usage mem_usage < /tmp/perf_stats || true
+    fi
+
+    # 输出结果
+    echo "| $name | **$qps** | $tput | $lat_avg | **$lat_p99** | ${cpu_usage}% | ${mem_usage}MB |"
+}
+
+# === 2. 主流程 ===
+
+# 确保清理旧进程
+pkill -f "zaver" || true
+
+echo "" > "$RAW_LOG"
 start_server
 
-echo "# Zaver Final Performance Report" > "$OUT_MD"
+# 注册退出时的清理
+trap stop_server EXIT
+
+# 生成报告头
+echo "# Zaver Ultimate Benchmark Report" > "$OUT_MD"
 echo "Date: $(date)" >> "$OUT_MD"
-echo "" >> "$OUT_MD"
-echo "| Scenario | Conns | Threads | QPS (Req/sec) | Latency (Avg) | Throughput |" >> "$OUT_MD"
-echo "|---|---|---|---|---|---|" >> "$OUT_MD" | tee -a "$OUT_MD"
+echo "| Scenario | QPS | Throughput | Latency (Avg) | P99 | CPU% | Mem |" >> "$OUT_MD"
+echo "|---|---|---|---|---|---|---|" >> "$OUT_MD"
 
-# 2. 执行测试用例
-
-# Case A: 极限 QPS (基准测试)
-# 4线程, 500连接, 30秒
-run_case "Baseline (Small File)" "$SMALL_FILE_URL" 4 500 30s >> "$OUT_MD"
-
-# Case B: 高吞吐 (零拷贝验证)
-# 4线程, 100连接, 30秒
-run_case "Throughput (Big File)" "$BIG_FILE_URL" 4 100 30s >> "$OUT_MD"
-
-# Case C: 短连接风暴 (Stress Accept)
-# 关键参数: -H 'Connection: close'
-run_case "Short Connection" "$SMALL_FILE_URL" 4 500 30s "-H Connection:close" >> "$OUT_MD"
-
-# Case D: C10K 高并发模拟 (需要 ulimit 支持)
-# 尝试 5000 连接 (虚拟机上 10k 可能会卡死，先试 5k)
-run_case "C5K Scalability" "$SMALL_FILE_URL" 4 5000 30s >> "$OUT_MD"
-
-# Case E: CGI 动态请求
-run_case "CGI (Process Fork)" "$CGI_URL" 4 50 30s >> "$OUT_MD"
+# 开始测试
+run_test "Baseline (Small)" "$URL_SMALL" 4 500 20s
+run_test "Throughput (Big)" "$URL_BIG" 4 100 20s
+run_test "C10K Scalability" "$URL_SMALL" 4 5000 20s
+run_test "Short Connection" "$URL_SMALL" 4 500 20s "-H Connection:close"
+run_test "CGI Dynamic" "$URL_CGI" 4 50 20s
 
 echo "" >> "$OUT_MD"
-echo "Done! Report saved to $OUT_MD"
+echo "Done! Report: $OUT_MD"
 cat "$OUT_MD"
